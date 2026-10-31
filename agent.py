@@ -12,9 +12,10 @@ entered through `setup` with hidden input.
 
 Cycle:
   1. List jobs/*.json in the repo, fetch each manifest (base64 content).
-  2. For status "pending": fetch its html and cover files, run the WeChat
-     calls through wechat_mp.py (imported), then PUT results/<id>.json and
-     PUT the manifest back with status done/failed.
+  2. For status "pending": if results/<id>.json already records a successful
+     draft, mark the job done without calling draft/add again. Otherwise
+     fetch html/cover, run WeChat calls, then PUT results/<id>.json (with
+     sha when the file already exists) and PUT the manifest done/failed.
   3. Print one JSON summary line.
 
 Commands:
@@ -85,6 +86,17 @@ def put_file(path, raw, message, token, sha=None):
     return gh(path, method="PUT", payload=payload, token=token)
 
 
+def put_file_upsert(path, raw, message, token):
+    """Create or update: Contents API requires sha when the path already exists."""
+    sha = None
+    try:
+        _, sha = get_file(path, token)
+    except RuntimeError as e:
+        if "HTTP 404" not in str(e):
+            raise
+    return put_file(path, raw, message, token, sha=sha)
+
+
 def capture(fn, args):
     buf = io.StringIO()
     with redirect_stdout(buf):
@@ -96,7 +108,7 @@ class Args:
     pass
 
 
-def run_job(job, sha, token):
+def run_job(job, token):
     import wechat_mp as w
     os.makedirs(TMP, exist_ok=True)
     html_raw, _ = get_file(job["html"], token)
@@ -120,9 +132,36 @@ def run_job(job, sha, token):
             "draft_media_id": draft["draft_media_id"]}
 
 
+def prior_success_result(job_id, token):
+    """Return prior results JSON if it already recorded a successful draft."""
+    try:
+        raw, _ = get_file(f"results/{job_id}.json", token)
+    except RuntimeError as e:
+        if "HTTP 404" in str(e):
+            return None
+        raise
+    prev = json.loads(raw.decode("utf-8"))
+    if prev.get("ok") and prev.get("draft_media_id"):
+        return prev
+    return None
+
+
+def write_job_status(entry_name, job, job_sha, token):
+    """Update jobs/<file>; refresh sha once on 409/422 conflict."""
+    body = json.dumps(job, ensure_ascii=False, indent=1).encode()
+    msg = f"agent: job {job['id']} {job['status']}"
+    try:
+        return put_file(f"jobs/{entry_name}", body, msg, token, sha=job_sha)
+    except RuntimeError as e:
+        if "HTTP 409" not in str(e) and "HTTP 422" not in str(e):
+            raise
+        _, fresh_sha = get_file(f"jobs/{entry_name}", token)
+        return put_file(f"jobs/{entry_name}", body, msg, token, sha=fresh_sha)
+
+
 def cycle(token):
     listing = gh("jobs", token=token)
-    done, failed, pending_seen = [], [], 0
+    done, failed, skipped, pending_seen = [], [], [], 0
     for entry in listing:
         if entry.get("type") != "file" or not entry["name"].endswith(".json"):
             continue
@@ -133,10 +172,19 @@ def cycle(token):
         pending_seen += 1
         result = {"id": job["id"], "ts": int(time.time())}
         try:
-            ids = run_job(job, sha, token)
-            result.update({"ok": True, **ids})
-            job["status"] = "done"
-            done.append(job["id"])
+            prior = prior_success_result(job["id"], token)
+            if prior:
+                result.update({"ok": True, "draft_media_id": prior["draft_media_id"],
+                               "cover_media_id": prior.get("cover_media_id", ""),
+                               "reused_prior_result": True})
+                job["status"] = "done"
+                skipped.append(job["id"])
+                done.append(job["id"])
+            else:
+                ids = run_job(job, token)
+                result.update({"ok": True, **ids})
+                job["status"] = "done"
+                done.append(job["id"])
         except SystemExit:
             result.update({"ok": False, "error": "wechat_mp call failed (errcode in agent log)"})
             job["status"] = "failed"
@@ -145,14 +193,28 @@ def cycle(token):
             result.update({"ok": False, "error": f"{type(e).__name__}: {e}"[:300]})
             job["status"] = "failed"
             failed.append(job["id"])
-        put_file(f"results/{job['id']}.json",
-                 json.dumps(result, ensure_ascii=False, indent=1).encode(),
-                 f"agent: result {job['id']}", token)
-        put_file(f"jobs/{entry['name']}",
-                 json.dumps(job, ensure_ascii=False, indent=1).encode(),
-                 f"agent: job {job['id']} {job['status']}", token, sha=sha)
+        # Always persist result + status so a PUT glitch cannot leave status=pending
+        # after draft/add (that loop caused the draft flood).
+        try:
+            put_file_upsert(f"results/{job['id']}.json",
+                            json.dumps(result, ensure_ascii=False, indent=1).encode(),
+                            f"agent: result {job['id']}", token)
+        except Exception as e:
+            result["result_put_error"] = f"{type(e).__name__}: {e}"[:200]
+            try:
+                put_file_upsert(f"results/{job['id']}.json",
+                                json.dumps(result, ensure_ascii=False, indent=1).encode(),
+                                f"agent: result {job['id']} (retry)", token)
+            except Exception:
+                pass
+        try:
+            write_job_status(entry["name"], job, sha, token)
+        except Exception as e:
+            print(json.dumps({"ok": False, "error": f"job status put failed for {job['id']}: {e}"},
+                             ensure_ascii=False), file=sys.stderr)
     print(json.dumps({"ok": True, "pending_seen": pending_seen,
-                      "done": done, "failed": failed}, ensure_ascii=False))
+                      "done": done, "failed": failed, "skipped": skipped},
+                     ensure_ascii=False))
 
 
 def cmd_setup():
